@@ -2,21 +2,38 @@
 import polars as pl
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 
 
+
+
+plot_dir = Path(__file__).parent / "plots"
+plot_dir.mkdir(exist_ok = True)  # make the folder if it is not there yet
+
+def save_plot(file_name):
+    plt.savefig(plot_dir / file_name, dpi = 150)  # dpi = 150 makes the picture sharper than the default
+    print(f"Saved {plot_dir / file_name}")
+
+
+def print_step(number, title):
+    print()
+    print(f"========== Step {number}: {title} ==========")
+
+
+print_step(1, "Forward fill and print the data")
 df = pl.read_parquet("~/Downloads/software-data.parquet").fill_null(strategy="forward")
 print(df)
 
 
 
 
-#All the givens are Motor RPM, the ratio for sproket GR = 12/41, tire radius WR = 0.2m 
+#All the givens are Motor RPM, the ratio for sproket GR = 12/41, tire radius WR = 0.2m
 # velocity = mRPM * 12/41 * 2pi/60 * 0.2
 # we need to change it to mile per hour
 # which means we multiply v by 2.23694
 # v_mile = v* 2.23694
 
-
+print_step(2, "Speed (mph) vs time, and the speed at 10 s")
 time = df["Time"]  # Time is already in seconds (0 ~ 164.58 s, one sample every ~0.012 s), so no conversion is needed.
 #We use the equation that we got from the line 12
 mRPM  = df["SME_TRQSPD_Speed"]
@@ -44,9 +61,11 @@ ms_10s = row_10s["speed_ms"][0]
 print(f"Speed at {t_10s:.2f} s: {mph_10s:.2f} mph ({ms_10s:.2f} m/s)")
 plt.plot(t_10s, mph_10s, "o", color = "blue", label = f"10 s: {mph_10s:.2f} mph")
 plt.legend()
-plt.show()
+save_plot("step2_speed_vs_time.png")
+# No plt.show() here: every window is shown once at the very end, so all the printed results come out first
 
 #Step 3
+print_step(3, "Time frames for accelerating, braking, and coasting")
 
 # We save each state as a condition so we can reuse it in Step 5 and Step 6
 accelerating = (pl.col("SME_THROTL_TorqueDemand") > 100) & (pl.col("ETC_STATUS_BRAKE_SENSE_VOLTAGE") <= 375)
@@ -104,7 +123,7 @@ axs[2].set_title("Coasting")
 axs[2].set_xlabel("Time (s)")
 
 plt.tight_layout()
-plt.show()
+save_plot("step3_driving_states.png")
 
 # Step 4
 
@@ -116,6 +135,12 @@ laps = [
     {"lap": 1, "start": 18.92, "end": 76.86},   # out to the east end and back to the west end (about 293 m)
     {"lap": 2, "start": 94.24, "end": 131.84},  # out to the east end, then stopped there without coming back (about 188 m)
 ]
+
+print_step(4, "Number of laps, with start and end time")
+print(f"Laps driven: {len(laps)}")
+print("  Lap   Start (s)   End (s)   Duration (s)")
+for lap_info in laps:
+    print(f"  {lap_info['lap']:3d} {lap_info['start']:11.2f} {lap_info['end']:9.2f} {lap_info['end'] - lap_info['start']:12.2f}")
 
 # Draw the whole run in gray, then each lap in its own color on top.
 # A circle marks where each lap starts and an X marks where it ends.
@@ -139,9 +164,10 @@ plt.ylabel("Latitude")
 plt.title("GPS Track Layout (circle = lap start, X = lap end)")
 plt.legend()
 plt.grid(True)
-plt.show()
+save_plot("step4_gps_track.png")
 
 #Step 5
+print_step(5, "Max speed, max acceleration, accel time, and coast time for each lap")
 # List to store metrics for each lap
 lap_results = []
 
@@ -189,6 +215,7 @@ g = 9.81
 
 # Step 6: keep coasting at 5 m/s or faster, then drop any coasting frame shorter than 1 second.
 # The short frames are flickers right after a real coast-down, where the speed bounces around 5 m/s.
+print_step(6, "Coast-down data (5 m/s or faster, 1 s or longer)")
 coast_fast = coasting & (pl.col("speed_ms") >= 5.0)
 coast_on = df.select(coast_fast.alias("on"))["on"].to_numpy()
 coast_frames, dropped = find_frames(coast_on, 1.0)
@@ -208,6 +235,7 @@ print_frames(coast_frames)
 # Step 7: dv/dt = (change in speed between two readings) / (time between them), as projects.md describes.
 # We do it one coast-down at a time, so we never take a difference across the gap between two coast-downs.
 # Each pair of readings gives one dv/dt, so v² uses the middle of the pair to line up with it.
+print_step(7, "Drag (CdA) and rolling resistance (Crr) from the coast-down")
 v_squared = []
 dv_dt = []
 for part in coast_parts:
@@ -237,4 +265,118 @@ plt.ylabel("dv/dt (m/s²)")
 plt.title("Coast-down: dv/dt vs v²")
 plt.legend()
 plt.grid(True)
+save_plot("step7_coastdown_fit.png")
+
+
+bin_centers = []
+bin_means = []
+bin_errors = []
+print("  v² bin (m²/s²)   points   average dv/dt (m/s²)")
+for low in range(25, 125, 10):
+    high = low + 10
+    # Collect every dv/dt whose v² falls in this bin
+    in_bin = []
+    for i in range(len(v_squared)):
+        if v_squared[i] >= low and v_squared[i] < high:
+            in_bin.append(dv_dt[i])
+    in_bin = np.array(in_bin)
+
+    if len(in_bin) < 50:
+        print(f"  {low:5d} - {high:4d} {len(in_bin):8d}   (skipped: fewer than 50 points)")
+    else:
+        error = in_bin.std() / np.sqrt(len(in_bin))
+        bin_centers.append((low + high) / 2)
+        bin_means.append(in_bin.mean())
+        bin_errors.append(error)
+        print(f"  {low:5d} - {high:4d} {len(in_bin):8d}   {in_bin.mean():+.3f} ± {error:.3f}")
+
+plt.figure(figsize = (8, 5))
+plt.plot(v_squared, dv_dt, '.', color = "lightgray", alpha = 0.3, label = "Coast-down data (each pair of readings)")
+# errorbar draws each average as a dot with a line above and below it (the error bar)
+plt.errorbar(bin_centers, bin_means, yerr = bin_errors, fmt = "o", color = "black", capsize = 4,
+             label = "Average in each v² bin (± standard error)")
+plt.plot(x_line, slope * x_line + intercept, color = "red", label = f"Fit: dv/dt = {slope:.5f} * v² {intercept:+.4f}")
+# The intercept alone is the rolling resistance part: it is the same at every speed, so it is a flat line.
+plt.plot(x_line, [intercept, intercept], color = "blue", linestyle = "--", label = f"Rolling resistance only: {intercept:.3f} m/s²")
+# fill_between colors the space between two lines.
+# The gap between the flat blue line and the red line is the extra slowing from drag, which grows with v².
+plt.fill_between(x_line, intercept, slope * x_line + intercept, color = "red", alpha = 0.15, label = "Extra slowing from drag")
+plt.ylim(-1.5, 1.0)  # zoom in around the line; dots outside this range are still used in the fit
+plt.xlabel("v² (m²/s²)")
+plt.ylabel("dv/dt (m/s²)")
+plt.title("Coast-down: dv/dt vs v² (zoomed in, with bin averages)")
+plt.legend(loc = "upper left", fontsize = 8)
+plt.grid(True)
+save_plot("step7_coastdown_fit_zoomed.png")
+
+
+
+# Step 9 (extra): how hard the brake is pressed, not just on/off
+print_step("10 (Extra)", "How hard the brake is pressed")
+
+
+brake_col = "ETC_STATUS_BRAKE_SENSE_VOLTAGE"
+# Not braking = 375 or below. The first 4 rows read 0 before the sensor starts, so skip them too.
+resting = df.filter((pl.col(brake_col) > 0) & (pl.col(brake_col) <= 375))[brake_col]
+rest_v = resting.median()  # the middle value, so a few odd readings don't move it
+max_v = df[brake_col].max()
+brake_pct = ((df[brake_col] - rest_v) / (max_v - rest_v) * 100).to_numpy()
+# .to_numpy() from polars can't be changed, so np.array() makes our own copy that we can change below
+brake_pct = np.array(brake_pct)
+for i in range(len(brake_pct)):
+    if brake_pct[i] < 0:
+        brake_pct[i] = 0  # readings a little below resting (and the first 4 zero rows) count as 0 %
+threshold_pct = (375 - rest_v) / (max_v - rest_v) * 100
+print(f"Resting voltage: {rest_v:.0f}, highest voltage: {max_v:.0f}, Step 3 threshold 375 = {threshold_pct:.1f} %")
+
+brake_v = df[brake_col].to_numpy()
+brake_f = df["TMAIN_DATA_BRAKES_F"].to_numpy()
+brake_r = df["TMAIN_DATA_BRAKES_R"].to_numpy()
+# Correlation: 1 = the two always move together, 0 = no relation.
+# np.corrcoef gives a 2x2 table, and [0, 1] is the number between the two columns.
+print(f"Brake voltage vs front pressure: correlation {np.corrcoef(brake_v, brake_f)[0, 1]:.2f}, "
+      f"vs rear pressure: {np.corrcoef(brake_v, brake_r)[0, 1]:.2f}")
+
+# For each braking frame from Step 3: how hard, and was the car still moving?
+# F/R = front pressure / rear pressure at the hardest moment (1.0 means front and rear get the same pressure)
+brake_frames, dropped = find_frames(states["Braking"].to_numpy(), 0.5)
+speed = df["speed_ms"].to_numpy()
+moving_count = 0
+print("  Start (s)   End (s)   Max (%)   Mean (%)   Start v (m/s)   End v (m/s)   F/R at max")
+for start, end in brake_frames:
+    pct = brake_pct[start:end + 1]
+    # Find the row where the brake was pressed hardest in this frame
+    hardest = start
+    for i in range(start, end + 1):
+        if brake_pct[i] > brake_pct[hardest]:
+            hardest = i
+    print(f"  {times[start]:9.2f} {times[end]:9.2f} {pct.max():9.1f} {pct.mean():10.1f} "
+          f"{speed[start]:15.2f} {speed[end]:13.2f} {brake_f[hardest] / brake_r[hardest]:12.2f}")
+    if speed[start] > 0.5:
+        moving_count = moving_count + 1
+print(f"Braking frames that start while the car is moving (over 0.5 m/s): {moving_count} of {len(brake_frames)}")
+print("-> The driver mostly pressed the brake to hold the car after it had already rolled to a stop.")
+
+fig, axs = plt.subplots(2, 1, figsize = (12, 6), sharex = True)
+axs[0].plot(times, brake_pct, color = "red")
+axs[0].plot([times[0], times[len(times) - 1]], [threshold_pct, threshold_pct], color = "gray", linestyle = "--",
+            label = f"Step 3 threshold (375 = {threshold_pct:.1f} %)")
+axs[0].set_ylabel("Brake pressed (%)")
+axs[0].set_title("How hard the brake is pressed (0 % = resting, 100 % = hardest press in this log)")
+axs[0].legend(loc = "upper right")
+axs[0].grid(True)
+axs[1].plot(times, speed, color = "black")
+axs[1].set_ylabel("Speed (m/s)")
+axs[1].set_xlabel("Time (s)")
+axs[1].set_title("Speed (to see whether the car was moving while braking)")
+axs[1].grid(True)
+# Shade the Step 3 braking frames on both graphs. axvspan colors the area between two times.
+for start, end in brake_frames:
+    axs[0].axvspan(times[start], times[end], color = "red", alpha = 0.1)
+    axs[1].axvspan(times[start], times[end], color = "red", alpha = 0.1)
+plt.tight_layout()
+save_plot("step10_brake_strength.png")
+
+# Show all 7 graphs at once. The script ends when the last window is closed.
 plt.show()
+
